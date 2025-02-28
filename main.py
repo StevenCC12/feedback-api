@@ -62,7 +62,7 @@ def remove_bracketed_text(text):
 def process_assignment(self, contact_id: str, contact_email: str, day: int, field1: str, field2: str):
     """
     Celery Background Task:
-    1️⃣ Waits 7-15 min before processing.
+    1️⃣ Waits 6-9 min before processing (code + GHL automations).
     2️⃣ Sends request to OpenAI Assistants API.
     3️⃣ Sends feedback back to GHL.
     """
@@ -88,7 +88,7 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
             user_input = f"Användaren lämnar in sin läxa för Dag 5. Användaren kommer att generera reviews på >{field1}<st sätt. Användarens viktigaste taktik för att generera reviews är >{field2}<."
             GHL_WEBHOOK_URL = GHL_WEBHOOK_URL_DAY_5
 
-    minutes = random.randint(7, 15)
+    minutes = random.randint(1, 4)
     wait_time = minutes * 60  # Convert to minutes
 
     print(f"🕒 Assignment received from {contact_email}. Will process in {minutes} minutes...")
