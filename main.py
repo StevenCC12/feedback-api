@@ -36,12 +36,13 @@ celery_app.conf.broker_connection_retry_on_startup = True
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-# ✅ GHL Webhook URLs (one for each day)
-GHL_WEBHOOK_URL_DAY_1 = "https://services.leadconnectorhq.com/hooks/kFKnF888dp7eKChjLxb9/webhook-trigger/beafa555-9b19-45f9-823b-0a4ee4a6eeb5"
-GHL_WEBHOOK_URL_DAY_2 = "https://services.leadconnectorhq.com/hooks/kFKnF888dp7eKChjLxb9/webhook-trigger/56ec6125-9870-4931-975b-41c4e0014c44"
-GHL_WEBHOOK_URL_DAY_3 = "https://services.leadconnectorhq.com/hooks/kFKnF888dp7eKChjLxb9/webhook-trigger/8ace25bb-5a0b-4cfc-9641-2e97678b0eb8"
-GHL_WEBHOOK_URL_DAY_4 = "https://services.leadconnectorhq.com/hooks/kFKnF888dp7eKChjLxb9/webhook-trigger/9a9cc420-ae3c-4369-bb9e-797a6f225273"
-GHL_WEBHOOK_URL_DAY_5 = "https://services.leadconnectorhq.com/hooks/kFKnF888dp7eKChjLxb9/webhook-trigger/2b6c1401-ef23-4fe8-a507-f7b9965eecf7"
+# ✅ GHL Webhook URLs (one for each day) and a Slack Webhook URL in the rare case of OpenAI failure
+GHL_WEBHOOK_URL_DAY_1 = os.getenv("GHL_WEBHOOK_URL_DAY_1")
+GHL_WEBHOOK_URL_DAY_2 = os.getenv("GHL_WEBHOOK_URL_DAY_2")
+GHL_WEBHOOK_URL_DAY_3 = os.getenv("GHL_WEBHOOK_URL_DAY_3")
+GHL_WEBHOOK_URL_DAY_4 = os.getenv("GHL_WEBHOOK_URL_DAY_4")
+GHL_WEBHOOK_URL_DAY_5 = os.getenv("GHL_WEBHOOK_URL_DAY_5")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 # ✅ FastAPI App
 app = FastAPI(debug=True)
@@ -58,6 +59,7 @@ class AssignmentRequest(BaseModel):
 def remove_bracketed_text(text):
     return re.sub(r'【.*?】', '', text)
 
+# Define Celery Task
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_kwargs={"max_retries": 3, "countdown": 60})
 def process_assignment(self, contact_id: str, contact_email: str, day: int, field1: str, field2: str):
     """
@@ -88,41 +90,89 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
             user_input = f"Användaren lämnar in sin läxa för Dag 5. Användaren kommer att generera reviews på >{field1}<st sätt. Användarens viktigaste taktik för att generera reviews är >{field2}<."
             GHL_WEBHOOK_URL = GHL_WEBHOOK_URL_DAY_5
 
-    minutes = random.randint(1, 4)
+    minutes = random.randint(1, 3)
     wait_time = minutes * 60  # Convert to minutes
 
     print(f"🕒 Assignment received from {contact_email}. Will process in {minutes} minutes...")
 
-    time.sleep(wait_time)  # Wait 7-15 min before processing
+    time.sleep(wait_time)  # Wait 1-3 min before processing
 
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # ✅ Step 1: Start OpenAI Thread
     try:
-        # Send to OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
         thread = client.beta.threads.create(messages=[{"role": "user", "content": user_input}])
         run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=ASSISTANT_ID)
+    except Exception as e:
+        print(f"❌ Error creating OpenAI thread: {str(e)}")
+        raise self.retry(exc=e)
 
-        while run.status != "completed":
-            time.sleep(10)  # Prevent excessive API calls
+    # ✅ Step 2: Poll OpenAI for Completion
+    attempts = 0
+    max_attempts = 30  # Don't check more than 30 times
+    sleep_interval = 10  # Wait 10s per attempt
+
+    while run.status not in ["completed", "failed", "cancelled"]:
+        if attempts >= max_attempts:
+            print(f"❌ OpenAI took too long. Aborting after {max_attempts * sleep_interval} seconds.")
+            raise Exception("OpenAI response took too long.")
+
+        time.sleep(sleep_interval)  # Wait before the next check
+        attempts += 1
+
+        try:
             run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+            print(f"🔄 Attempt {attempts}: OpenAI Status = {run.status}")
+        except Exception as e:
+            print(f"❌ Error checking OpenAI status: {str(e)}")
+            raise self.retry(exc=e)
 
-        # Retrieve OpenAI Response
+    # ✅ Step 3: Handle Failures & Retrieve OpenAI Response
+    if run.status == "failed":
+        print(f"❌ OpenAI run failed: {run}")
+        
+        slack_payload = {
+        "text": f"🚨 *Amazon Challenge Feedback Alert!*\n"
+                f"❌ OpenAI failed to generate feedback for *{contact_email}* (Day {day}).\n"
+                f"They gave these answers: {field1}, {field2}.\n"
+                f"📌 Please review manually and send a manual feedback email!"
+        }
+
+        try:
+            response = requests.post(SLACK_WEBHOOK_URL, json=slack_payload)
+            if response.status_code == 200:
+                print("✅ Slack alert sent successfully!")
+            else:
+                print(f"⚠️ Slack alert failed: {response.status_code}, {response.text}")
+        except Exception as e:
+            print(f"❌ Error sending Slack alert: {str(e)}")
+
+        # 🚨 Still raise an exception so Celery logs the failure properly
+        raise Exception("OpenAI task failed.")
+
+    try:
         message_response = client.beta.threads.messages.list(thread_id=thread.id)
         latest_message = message_response.data[0]
         assistant_output = latest_message.content[0].text.value
         feedback = remove_bracketed_text(assistant_output)
         formatted_feedback = feedback.replace("\n", "<br>")
-
-        # Send Feedback to GHL
-        response = requests.post(
-            GHL_WEBHOOK_URL,
-            json={"contact_id": contact_id, "contact_email": contact_email, "feedback": formatted_feedback}
-        )
-
-        print(f"✅ Feedback sent for {contact_email}: {formatted_feedback} (Status: {response.status_code})")
-
     except Exception as e:
-        print(f"❌ Error processing assignment for {contact_email}: {str(e)}")
-        raise self.retry(exc=e)  # ✅ Automatically retry if the task fails
+        print(f"❌ Error retrieving OpenAI response: {str(e)}")
+        raise self.retry(exc=e)
+
+    # ✅ Step 4: Send Feedback to GHL
+    payload = {
+        "contact_id": contact_id,
+        "contact_email": contact_email,
+        "feedback": formatted_feedback,
+    }
+
+    try:
+        response = requests.post(GHL_WEBHOOK_URL, json=payload)
+        print(f"✅ Feedback sent! Status: {response.status_code}, Response: {response.text}")
+    except Exception as e:
+        print(f"❌ Error sending feedback to GHL: {str(e)}")
+        raise self.retry(exc=e)
 
 @app.post("/receive-assignment/")
 def receive_assignment(data: AssignmentRequest):
