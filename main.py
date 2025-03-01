@@ -37,6 +37,15 @@ celery_app = Celery(
     backend_use_ssl=CELERY_SSL_OPTIONS
 )
 
+# Disable restoration of unacknowledged messages
+celery_app.conf.update(
+    task_acks_late=False,               # Immediately ACK task so it won't be re-queued
+    task_reject_on_worker_lost=False,   # Don't re-queue if worker is lost
+    worker_prefetch_multiplier=1        # Only prefetch 1 task at a time
+)
+
+celery_app.conf.broker_connection_retry_on_startup = True
+
 # ✅ Fix Celery 6.0 deprecation warning
 celery_app.conf.broker_connection_retry_on_startup = True
 
@@ -145,9 +154,10 @@ def send_ghl_feedback(contact_id, contact_email, feedback, webhook_url, timeout=
         logging.error("❌ Error sending feedback to GHL: %s", str(e))
         raise
 
-@celery_app.task(bind=True, autoretry_for=(Exception,), retry_kwargs={"max_retries": 3, "countdown": 60})
+@celery_app.task(bind=True)  # <--- No autoretry_for here
 def process_assignment(self, contact_id: str, contact_email: str, day: int, field1: str, field2: str):
     """
+    Task that does not auto-retry. If it fails, it fails once and won't be restored or retried.
     Celery Background Task:
     1️⃣ Waits 1-3 min before processing.
     2️⃣ Sends request to OpenAI Assistants API.
@@ -247,6 +257,7 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
         raise self.retry(exc=e)
 
 # FastAPI endpoint to receive assignments
+
 @app.post("/receive-assignment/")
 def receive_assignment(data: AssignmentRequest):
     logging.info("✅ Received assignment from %s", data.contact_email)
@@ -254,5 +265,11 @@ def receive_assignment(data: AssignmentRequest):
     logging.info("Field 1: %s", data.field1)
     logging.info("Field 2: %s", data.field2)
 
-    process_assignment.delay(data.contact_id, data.contact_email, data.day, data.field1, data.field2)
+    process_assignment.delay(
+        data.contact_id,
+        data.contact_email,
+        data.day,
+        data.field1,
+        data.field2
+    )
     return {"message": "Assignment received! Processing in Celery queue."}
