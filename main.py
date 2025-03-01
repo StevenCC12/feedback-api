@@ -69,7 +69,12 @@ def remove_bracketed_text(text):
     return re.sub(r'【.*?】', '', text)
 
 # Helper function to poll OpenAI run with exponential backoff
-def poll_openai_run(client, thread, run, max_attempts=30):
+def poll_openai_run(client, thread, run, max_attempts=5):
+    """
+    Poll the OpenAI run until it's completed, failed, or cancelled.
+    By default, tries up to 5 times with exponential backoff.
+    Increase or decrease max_attempts if you want to poll more/less.
+    """
     attempts = 0
     wait_time = 10  # initial wait time in seconds
 
@@ -77,24 +82,25 @@ def poll_openai_run(client, thread, run, max_attempts=30):
         if attempts >= max_attempts:
             logging.error("❌ OpenAI took too long. Aborting after %s attempts.", max_attempts)
             raise Exception("OpenAI response took too long.")
+
         time.sleep(wait_time)
         wait_time = min(wait_time * 1.5, 60)  # Exponential backoff capped at 60s
         attempts += 1
         run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
         logging.info("🔄 Attempt %s: OpenAI Status = %s", attempts, run.status)
 
-        if run.status == "failed" and "server_error" in str(run.last_error):
-            logging.error("❌ OpenAI server error encountered during polling. Not retrying.")
-            return run
     return run
 
 # Helper function to send a Slack alert with timeout and logging
-def send_slack_alert(contact_email, day, field1, field2, timeout=10):
+def send_slack_alert(contact_email, day, field1, field2, error_code, error_message, timeout=10):
     slack_payload = {
-        "text": f"🚨 *Amazon Challenge Feedback Alert!*\n"
-                f"❌ OpenAI failed to generate feedback for *{contact_email}* (Day {day}).\n"
-                f"Field 1: {field1}, Field 2: {field2}.\n"
-                f"📌 Please review manually and send a manual feedback email!"
+        "text": (
+            f"🚨 *Amazon Challenge Feedback Alert!*\n"
+            f"❌ OpenAI failed to generate feedback for *{contact_email}* (Day {day}).\n"
+            f"Field 1: {field1}, Field 2: {field2}.\n"
+            f"Error Code: {error_code}, Message: {error_message}\n"
+            f"📌 Please review manually and send a manual feedback email!"
+        )
     }
     try:
         response = requests.post(SLACK_WEBHOOK_URL, json=slack_payload, timeout=timeout)
@@ -108,14 +114,15 @@ def send_slack_alert(contact_email, day, field1, field2, timeout=10):
     return False
 
 # Helper function to send failsafe payload to GHL
-def send_failsafe_payload(contact_email, day, field1, field2, error_message, timeout=10):
+def send_failsafe_payload(contact_email, day, field1, field2, error_code, error_message, timeout=10):
     payload = {
         "timestamp": datetime.utcnow().isoformat(),
         "email": contact_email,
         "day": day,
         "field1": field1,
         "field2": field2,
-        "error_message": error_message
+        "error_code": error_code,       # <--- separate error code
+        "error_message": error_message  # <--- separate error message
     }
     try:
         response = requests.post(GHL_WEBHOOK_FAILSAFE, json=payload, timeout=timeout)
@@ -138,7 +145,6 @@ def send_ghl_feedback(contact_id, contact_email, feedback, webhook_url, timeout=
         logging.error("❌ Error sending feedback to GHL: %s", str(e))
         raise
 
-# Define Celery Task
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_kwargs={"max_retries": 3, "countdown": 60})
 def process_assignment(self, contact_id: str, contact_email: str, day: int, field1: str, field2: str):
     """
@@ -165,7 +171,6 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
         user_input = f"Användaren lämnar in sin läxa för Dag 5. Användaren kommer att generera reviews på >{field1}<st sätt. Användarens viktigaste taktik för att generera reviews är >{field2}<."
         ghl_webhook_url = GHL_WEBHOOK_URL_DAY_5
     else:
-        # Although this case should not occur, we include a safeguard
         error_msg = f"Invalid day value received: {day}"
         logging.error(error_msg)
         raise ValueError(error_msg)
@@ -189,12 +194,27 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
     # Step 2: Poll OpenAI for Completion with exponential backoff
     run = poll_openai_run(client, thread, run)
     if run.status == "failed":
-        logging.error("❌ OpenAI run failed: %s", run)
-        # Send Slack alert; if it fails, log a warning
-        if not send_slack_alert(contact_email, day, field1, field2):
-            logging.warning("Slack alert could not be sent successfully.")
+        # Extract the error code and message separately
+        error_code = getattr(run.last_error, "code", "N/A")
+        error_message = getattr(run.last_error, "message", "N/A")
+
+        logging.error("❌ OpenAI run failed: %s - %s", error_code, error_message)
+
+        # Send Slack alert
+        send_slack_alert(contact_email, day, field1, field2, error_code, error_message)
         # Log failed task to GHL failsafe
-        send_failsafe_payload(contact_email, day, field1, field2, str(run.last_error))
+        send_failsafe_payload(contact_email, day, field1, field2, error_code, error_message)
+
+        # If the error code is "server_error", do not retry; just mark the task as failed and return
+        if error_code == "server_error":
+            # This marks the Celery task as FAILURE but does NOT raise an exception -> no retry
+            self.update_state(
+                state="FAILURE",
+                meta={"exc_type": error_code, "exc_message": error_message},
+            )
+            return
+
+        # Otherwise, raise an exception so Celery logs the failure and (if configured) retries
         raise Exception("OpenAI task failed.")
 
     # Step 3: Retrieve OpenAI Response with data validity checks
@@ -204,12 +224,14 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
             error_msg = "No messages received from OpenAI."
             logging.error("❌ %s", error_msg)
             raise Exception(error_msg)
+
         latest_message = message_response.data[0]
         # Validate expected structure of the message
         if not latest_message.content or not latest_message.content[0].text:
             error_msg = "Invalid message format received from OpenAI."
             logging.error("❌ %s", error_msg)
             raise Exception(error_msg)
+
         assistant_output = latest_message.content[0].text.value
         feedback = remove_bracketed_text(assistant_output)
         formatted_feedback = feedback.replace("\n", "<br>")
