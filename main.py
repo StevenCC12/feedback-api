@@ -78,20 +78,25 @@ def remove_bracketed_text(text):
     return re.sub(r'【.*?】', '', text)
 
 # Helper function to poll OpenAI run with exponential backoff
-def poll_openai_run(client, thread, run, max_attempts=10):
+def poll_openai_run(client, thread, run, max_attempts=5):
     attempts = 0
-    wait_time = 10  # initial wait time in seconds
+    wait_time = 30  # Start with 30s instead of 10s
 
     while run.status not in ["completed", "failed", "cancelled"]:
         if attempts >= max_attempts:
             logging.error("❌ OpenAI took too long. Aborting after %s attempts.", max_attempts)
-            # Instead of raising an exception, we mark the run as failed with a timeout error.
+            # Mark the run as failed with a timeout error
             run.status = "failed"
-            run.last_error = {"code": "timeout", "message": "OpenAI response took too long."}
+            # Store as an object or dictionary, whichever your code expects
+            run.last_error = {
+                "code": "timeout",
+                "message": "OpenAI response took too long."
+            }
             break
 
         time.sleep(wait_time)
-        wait_time = min(wait_time * 1.5, 60)  # Exponential backoff capped at 60s
+        # Exponential backoff: increase wait_time by 1.5x each iteration, cap at 120s
+        wait_time = min(wait_time * 1.5, 120)
         attempts += 1
 
         run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
@@ -201,24 +206,36 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
         # Optionally, mark the task as failed here; or retry manually if desired.
         raise Exception("Error creating OpenAI thread.")
 
-    # Step 2: Poll OpenAI for Completion with exponential backoff
+    # Step 2: Poll OpenAI for Completion
     run = poll_openai_run(client, thread, run)
     if run.status == "failed":
-        error_code = run.last_error.get("code", "N/A")
-        error_message = run.last_error.get("message", "N/A")
+        # Safely extract code/message using getattr
+        error_code = getattr(run.last_error, "code", None)
+        error_message = getattr(run.last_error, "message", None)
+
+        # If last_error is a dict, use run.last_error.get("code")
+        # If last_error is an object, use getattr(run.last_error, "code", "N/A")
+        # or do a hybrid approach:
+        if isinstance(run.last_error, dict):
+            error_code = run.last_error.get("code", "N/A")
+            error_message = run.last_error.get("message", "N/A")
+        else:
+            error_code = getattr(run.last_error, "code", "N/A")
+            error_message = getattr(run.last_error, "message", "N/A")
+
         logging.error("❌ OpenAI run failed: %s - %s", error_code, error_message)
 
-        # Send Slack alert and log failsafe task
+        # Slack alert, failsafe, etc.
         send_slack_alert(contact_email, day, field1, field2, error_code, error_message)
         send_failsafe_payload(contact_email, day, field1, field2, error_code, error_message)
 
-        # For errors we consider non-transient (e.g., server_error or timeout), update task state and return gracefully
+        # Check error_code
         if error_code in ("server_error", "timeout"):
             self.update_state(
                 state="FAILURE",
                 meta={"exc_type": error_code, "exc_message": error_message},
             )
-            return  # End the task gracefully
+            return
         else:
             raise Exception("OpenAI task failed.")
 
