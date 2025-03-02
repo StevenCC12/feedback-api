@@ -190,10 +190,10 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
         raise ValueError(error_msg)
 
     # Random delay of 1-3 minutes before processing
-    minutes = random.randint(1, 3)
-    delay_seconds = minutes * 60
-    logging.info("🕒 Assignment received from %s. Will process in %d minutes...", contact_email, minutes)
-    time.sleep(delay_seconds)
+    #minutes = random.randint(1, 3)
+    #delay = minutes * 60
+    #logging.info("🕒 Assignment received from %s. Will process in %d minutes...", contact_email, minutes)
+    #time.sleep(delay)
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
