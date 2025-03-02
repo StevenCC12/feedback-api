@@ -78,23 +78,22 @@ def remove_bracketed_text(text):
     return re.sub(r'【.*?】', '', text)
 
 # Helper function to poll OpenAI run with exponential backoff
-def poll_openai_run(client, thread, run, max_attempts=5):
-    """
-    Poll the OpenAI run until it's completed, failed, or cancelled.
-    By default, tries up to 5 times with exponential backoff.
-    Increase or decrease max_attempts if you want to poll more/less.
-    """
+def poll_openai_run(client, thread, run, max_attempts=10):
     attempts = 0
     wait_time = 10  # initial wait time in seconds
 
     while run.status not in ["completed", "failed", "cancelled"]:
         if attempts >= max_attempts:
             logging.error("❌ OpenAI took too long. Aborting after %s attempts.", max_attempts)
-            raise Exception("OpenAI response took too long.")
+            # Instead of raising an exception, we mark the run as failed with a timeout error.
+            run.status = "failed"
+            run.last_error = {"code": "timeout", "message": "OpenAI response took too long."}
+            break
 
         time.sleep(wait_time)
         wait_time = min(wait_time * 1.5, 60)  # Exponential backoff capped at 60s
         attempts += 1
+
         run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
         logging.info("🔄 Attempt %s: OpenAI Status = %s", attempts, run.status)
 
@@ -199,33 +198,29 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
         run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=ASSISTANT_ID)
     except Exception as e:
         logging.error("❌ Error creating OpenAI thread: %s", str(e))
-        raise self.retry(exc=e)
+        # Optionally, mark the task as failed here; or retry manually if desired.
+        raise Exception("Error creating OpenAI thread.")
 
     # Step 2: Poll OpenAI for Completion with exponential backoff
     run = poll_openai_run(client, thread, run)
     if run.status == "failed":
-        # Extract the error code and message separately
-        error_code = getattr(run.last_error, "code", "N/A")
-        error_message = getattr(run.last_error, "message", "N/A")
-
+        error_code = run.last_error.get("code", "N/A")
+        error_message = run.last_error.get("message", "N/A")
         logging.error("❌ OpenAI run failed: %s - %s", error_code, error_message)
 
-        # Send Slack alert
+        # Send Slack alert and log failsafe task
         send_slack_alert(contact_email, day, field1, field2, error_code, error_message)
-        # Log failed task to GHL failsafe
         send_failsafe_payload(contact_email, day, field1, field2, error_code, error_message)
 
-        # If the error code is "server_error", do not retry; just mark the task as failed and return
-        if error_code == "server_error":
-            # This marks the Celery task as FAILURE but does NOT raise an exception -> no retry
+        # For errors we consider non-transient (e.g., server_error or timeout), update task state and return gracefully
+        if error_code in ("server_error", "timeout"):
             self.update_state(
                 state="FAILURE",
                 meta={"exc_type": error_code, "exc_message": error_message},
             )
-            return
-
-        # Otherwise, raise an exception so Celery logs the failure and (if configured) retries
-        raise Exception("OpenAI task failed.")
+            return  # End the task gracefully
+        else:
+            raise Exception("OpenAI task failed.")
 
     # Step 3: Retrieve OpenAI Response with data validity checks
     try:
@@ -236,7 +231,6 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
             raise Exception(error_msg)
 
         latest_message = message_response.data[0]
-        # Validate expected structure of the message
         if not latest_message.content or not latest_message.content[0].text:
             error_msg = "Invalid message format received from OpenAI."
             logging.error("❌ %s", error_msg)
@@ -247,17 +241,16 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
         formatted_feedback = feedback.replace("\n", "<br>")
     except Exception as e:
         logging.error("❌ Error retrieving OpenAI response: %s", str(e))
-        raise self.retry(exc=e)
+        raise Exception("Error retrieving OpenAI response.")
 
     # Step 4: Send Feedback to GHL
     try:
         send_ghl_feedback(contact_id, contact_email, formatted_feedback, ghl_webhook_url)
     except Exception as e:
-        logging.error("❌ Error in sending feedback to GHL: %s", str(e))
-        raise self.retry(exc=e)
+        logging.error("❌ Error sending feedback to GHL: %s", str(e))
+        raise Exception("Error sending feedback to GHL.")
 
 # FastAPI endpoint to receive assignments
-
 @app.post("/receive-assignment/")
 def receive_assignment(data: AssignmentRequest):
     logging.info("✅ Received assignment from %s", data.contact_email)
