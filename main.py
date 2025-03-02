@@ -170,19 +170,19 @@ def process_assignment(self, contact_id: str, contact_email: str, day: int, fiel
 
     # Determine the user input and appropriate GHL webhook URL based on day
     if day == 1:
-        user_input = f"Användaren lämnar in sin läxa för Dag 1. Användaren har valt marknadsplatsen >{field1}< och tagit fram snittförsäljningen >{field2}<."
+        user_input = f'Användaren lämnar in sin läxa för Dag 1. Användaren har valt marknadsplatsen: """{field1}""". Användaren har tagit fram snittförsäljningen: """{field2}""".'
         ghl_webhook_url = GHL_WEBHOOK_URL_DAY_1
     elif day == 2:
-        user_input = f"Användaren lämnar in sin läxa för Dag 2. Användaren har prisbilden >{field1}< och har en marginal på >{field2}<."
+        user_input = f'Användaren lämnar in sin läxa för Dag 2. Användaren har prisbilden: """{field1}""". Användaren har en marginal på: """{field2}""".'
         ghl_webhook_url = GHL_WEBHOOK_URL_DAY_2
     elif day == 3:
-        user_input = f"Användaren lämnar in sin läxa för Dag 3. Användaren kommer att sticka ut i sin förstabild genom: >{field1}<. Användarens viktigaste USP är: >{field2}<."
+        user_input = f'Användaren lämnar in sin läxa för Dag 3. Användaren kommer att sticka ut i sin förstabild genom: """{field1}""". Användarens viktigaste USP är: """{field2}""".'
         ghl_webhook_url = GHL_WEBHOOK_URL_DAY_3
     elif day == 4:
-        user_input = f"Användaren lämnar in sin läxa för Dag 4. Användaren kommer att stimulera A9 på >{field1}<st sätt. Användarens viktigaste målgrupp är >{field2}<."
+        user_input = f'Användaren lämnar in sin läxa för Dag 4. Användaren kommer att stimulera A9 på så här många sätt: """{field1}""". Användarens viktigaste målgrupp är: """{field2}""".'
         ghl_webhook_url = GHL_WEBHOOK_URL_DAY_4
     elif day == 5:
-        user_input = f"Användaren lämnar in sin läxa för Dag 5. Användaren kommer att generera reviews på >{field1}<st sätt. Användarens viktigaste taktik för att generera reviews är >{field2}<."
+        user_input = f'Användaren lämnar in sin läxa för Dag 5. Användaren kommer att generera reviews på så här många sätt: """{field1}""". Användarens viktigaste taktik för att generera reviews är """{field2}""".'
         ghl_webhook_url = GHL_WEBHOOK_URL_DAY_5
     else:
         error_msg = f"Invalid day value received: {day}"
